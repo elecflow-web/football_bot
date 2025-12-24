@@ -1,159 +1,156 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, JobQueue
-)
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, JobQueue
 import os
 import asyncio
 
-# ---------------------- Настройки ----------------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# ---------------------- Лиги ----------------------
+# Список 12 лиг
 LEAGUES = {
-    "soccer": [
-        ("Premier League", 39),
-        ("La Liga", 140),
-        ("Serie A", 135),
-        ("Bundesliga", 78),
-        ("Ligue 1", 61),
-        ("Eredivisie", 88),
-        ("Primeira Liga", 94),
-        ("Russian Premier League", 293),
-        ("Super Lig", 307),
-        ("Ukrainian Premier League", 262),
-        ("MLS", 253),
-        ("Championship", 40)
-    ]
+    "EPL": ("English Premier League", 39),
+    "LaLiga": ("La Liga", 140),
+    "Bundesliga": ("Bundesliga", 78),
+    "SerieA": ("Serie A", 135),
+    "Ligue1": ("Ligue 1", 61),
+    "Champions": ("Champions League", 2),
+    "Europa": ("Europa League", 3),
+    "MLS": ("MLS", 253),
+    "Brasileirao": ("Brasileirao", 7),
+    "Primeira": ("Primeira Liga", 94),
+    "Eredivisie": ("Eredivisie", 88),
+    "SuperLig": ("Turkish Super Lig", 81)
 }
 
-# ---------------------- Команды ----------------------
+# Обработчик /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("Анализ ставок", callback_data="analyze")],
-        [InlineKeyboardButton("Топ-матчи", callback_data="top_matches")]
+        [InlineKeyboardButton("Топ ставки", callback_data="topbets")],
+        [InlineKeyboardButton("Обновить данные", callback_data="refresh")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text(
-        "Привет! Бот запущен и готов к работе.", reply_markup=reply_markup
+        "Привет! Бот запущен и готов к работе.\nВыберите действие:", reply_markup=reply_markup
     )
 
-async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# Обработчик кнопок
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.data == "analyze":
+    
+    if query.data == "topbets":
         await query.edit_message_text("Идёт анализ матчей, подождите...")
         bets = await analyze_matches()
-        text = format_bets(bets)
-        await query.edit_message_text(text)
-    elif query.data == "top_matches":
-        await query.edit_message_text("Функция топ-матчей пока в разработке.")
+        if not bets:
+            await query.message.reply_text("На данный момент потенциально проходящих ставок нет.")
+            return
+        text = "💰 Рекомендации по ставкам:\n\n"
+        for b in bets[:15]:  # максимум 15 рекомендаций
+            value, league, match, market, price = b
+            text += f"{league} | {match} | {market} | Коэф: {price:.2f} | Value: {value:.2f}\n"
+        await query.message.reply_text(text)
+    elif query.data == "refresh":
+        await query.edit_message_text("Данные обновлены!")
 
-# ---------------------- Анализ матчей ----------------------
+# Асинхронная функция анализа матчей
 async def analyze_matches():
     bets = []
+    for sport, (lname, league_id) in LEAGUES.items():
+        fixtures = get_fixtures(league_id)  # реальные API
+        odds_list = get_odds(sport)         # реальные API
 
-    # Проходим по всем лигам
-    for sport, leagues in LEAGUES.items():
-        for lname, league_id in leagues:
-            fixtures = get_fixtures(league_id)  # Реальный API
-            odds_data = get_odds(sport)        # Реальный API
+        for f in fixtures:
+            home = f["teams"]["home"]
+            away = f["teams"]["away"]
+            
+            hxg = get_xg(home["id"], league_id)
+            axg = get_xg(away["id"], league_id)
+            total_goals = hxg + axg
+            xg_home = hxg / (hxg + axg) if hxg + axg > 0 else 0.5
+            elo_home = elo_prob(home.get("elo", 1500), away.get("elo", 1500))
+            model_home = 0.45 * xg_home + 0.35 * elo_home + 0.20 * 0.5
 
-            for f in fixtures:
-                home = f["teams"]["home"]
-                away = f["teams"]["away"]
+            prob_over25 = min(total_goals / 3.1, 0.78)
+            prob_under25 = 1 - prob_over25
+            prob_btts = min((hxg * axg) / 2.2, 0.75)
 
-                hxg = get_xg(home["id"], league_id)
-                axg = get_xg(away["id"], league_id)
-                total_goals = hxg + axg
+            for g in odds_list:
+                if home["name"] not in g["home_team"]:
+                    continue
+                for bm in g["bookmakers"]:
+                    for m in bm["markets"]:
+                        for o in m["outcomes"]:
+                            implied = 1 / o["price"]
+                            name = o["name"]
 
-                xg_home = hxg / (hxg + axg) if (hxg+axg) > 0 else 0.5
-                elo_home = elo_prob(home["elo"], away["elo"])
-                model_home = 0.45 * xg_home + 0.35 * elo_home + 0.2 * 0.5
-
-                prob_over25 = min(total_goals / 3.1, 0.78)
-                prob_under25 = 1 - prob_over25
-                prob_btts = min((hxg * axg) / 2.2, 0.75)
-
-                # Проходим по рынкам
-                for g in odds_data:
-                    if home["name"] not in g["home_team"]:
-                        continue
-                    for bm in g["bookmakers"]:
-                        for m in bm["markets"]:
-                            for o in m["outcomes"]:
-                                implied = 1 / o["price"]
-                                name = o["name"]
-
-                                # 1X2
-                                if m["key"] == "h2h" and name == home["name"]:
+                            # 1X2
+                            if m["key"] == "h2h":
+                                if name == home["name"]:
                                     value = model_home - implied
                                     if value > 0.08:
                                         bets.append((value, lname, f"{home['name']} vs {away['name']}", "П1", o["price"]))
-
-                                # Totals
-                                if m["key"] == "totals":
-                                    if "Over" in name:
-                                        value = prob_over25 - implied
-                                        if value > 0.08:
-                                            bets.append((value, lname, f"{home['name']} vs {away['name']}", name, o["price"]))
-                                    if "Under" in name:
-                                        value = prob_under25 - implied
-                                        if value > 0.08:
-                                            bets.append((value, lname, f"{home['name']} vs {away['name']}", name, o["price"]))
-
-                                # BTTS
-                                if m["key"] == "btts" and name == "Yes":
-                                    value = prob_btts - implied
+                                elif name == away["name"]:
+                                    value = (1 - model_home) - implied
                                     if value > 0.08:
-                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", "BTTS YES", o["price"]))
+                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", "П2", o["price"]))
 
-                                # Handicap
-                                if m["key"] == "spreads" and name == home["name"]:
+                            # Over/Under
+                            if m["key"] == "totals":
+                                if "Over" in name:
+                                    value = prob_over25 - implied
+                                    if value > 0.08:
+                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", name, o["price"]))
+                                elif "Under" in name:
+                                    value = prob_under25 - implied
+                                    if value > 0.08:
+                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", name, o["price"]))
+
+                            # BTTS
+                            if m["key"] == "btts" and name == "Yes":
+                                value = prob_btts - implied
+                                if value > 0.08:
+                                    bets.append((value, lname, f"{home['name']} vs {away['name']}", "BTTS YES", o["price"]))
+
+                            # Handicap
+                            if m["key"] == "spreads":
+                                if name == home["name"]:
                                     prob = model_home + 0.1
                                     value = prob - implied
                                     if value > 0.08:
                                         bets.append((value, lname, f"{home['name']} vs {away['name']}", f"Фора {o['point']}", o["price"]))
-
-                                if m["key"] == "spreads" and name == away["name"] and o["point"] == 1:
+                                elif name == away["name"] and o["point"] == 1:
                                     prob = 1 - model_home + 0.15
                                     value = prob - implied
                                     if value > 0.08:
                                         bets.append((value, lname, f"{home['name']} vs {away['name']}", "Фора +1 (гости)", o["price"]))
 
-                                # Double Chance 1X
-                                if m["key"] == "h2h" and name == home["name"]:
-                                    prob = model_home + 0.25
-                                    value = prob - implied
-                                    if value > 0.08:
-                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", "1X", o["price"]))
-
+                            # Double Chance
+                            if m["key"] == "h2h" and name == home["name"]:
+                                prob = model_home + 0.25
+                                value = prob - implied
+                                if value > 0.08:
+                                    bets.append((value, lname, f"{home['name']} vs {away['name']}", "1X", o["price"]))
     bets.sort(reverse=True, key=lambda x: x[0])
-    return bets[:12]
+    return bets
 
-def format_bets(bets):
-    text = "🔥 Рекомендованные ставки:\n\n"
-    for value, league, match, market, odd in bets:
-        text += f"{league}: {match}\n{market} — {odd:.2f} (Value: {value:.2f})\n\n"
-    return text
-
-# ---------------------- JobQueue ----------------------
-async def notify_top_bets(context: ContextTypes.DEFAULT_TYPE):
-    if TELEGRAM_CHAT_ID:
-        bets = await analyze_matches()
-        text = format_bets(bets)
+# JobQueue для автоматического обновления
+async def scheduled_job(context: ContextTypes.DEFAULT_TYPE):
+    bets = await analyze_matches()
+    if TELEGRAM_CHAT_ID and bets:
+        text = "💰 Автоматическое обновление топ ставок:\n\n"
+        for b in bets[:10]:
+            value, league, match, market, price = b
+            text += f"{league} | {match} | {market} | Коэф: {price:.2f} | Value: {value:.2f}\n"
         await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
-# ---------------------- Main ----------------------
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(handle_button))
-
-    # JobQueue каждые 10 минут
+    app.add_handler(CallbackQueryHandler(button_handler))
+    
+    # JobQueue
     job_queue: JobQueue = app.job_queue
-    job_queue.run_repeating(notify_top_bets, interval=600, first=10)
+    job_queue.run_repeating(scheduled_job, interval=600, first=10)
 
     app.run_polling()
 
