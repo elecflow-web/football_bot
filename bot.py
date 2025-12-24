@@ -1,24 +1,15 @@
-# bot.py
-import os
-import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    JobQueue,
+    ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, JobQueue
 )
-import httpx
+import os
+import asyncio
 
-# ---------------- CONFIG ----------------
+# ---------------------- Настройки ----------------------
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
-ODDS_API_KEY = os.environ.get("ODDS_API_KEY")
-XG_API_KEY = os.environ.get("XG_API_KEY")
 
-# ---------------- LEAGUES ----------------
-# Пример 12 лиг, можно расширить
+# ---------------------- Лиги ----------------------
 LEAGUES = {
     "soccer": [
         ("Premier League", 39),
@@ -30,129 +21,139 @@ LEAGUES = {
         ("Primeira Liga", 94),
         ("Russian Premier League", 293),
         ("Super Lig", 307),
-        ("Belgian Pro League", 95),
-        ("Swiss Super League", 203),
+        ("Ukrainian Premier League", 262),
         ("MLS", 253),
+        ("Championship", 40)
     ]
 }
 
-# ---------------- REAL DATA FUNCTIONS ----------------
-async def get_fixtures(league_id):
-    url = f"https://api.sportsdata.io/v4/soccer/scores/json/FixturesByLeague/{league_id}"
-    headers = {"Ocp-Apim-Subscription-Key": ODDS_API_KEY}
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, headers=headers)
-        r.raise_for_status()
-        return r.json()
+# ---------------------- Команды ----------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("Анализ ставок", callback_data="analyze")],
+        [InlineKeyboardButton("Топ-матчи", callback_data="top_matches")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        "Привет! Бот запущен и готов к работе.", reply_markup=reply_markup
+    )
 
-async def get_odds(sport):
-    url = f"https://api.the-odds-api.com/v4/sports/{sport}/odds"
-    params = {"apiKey": ODDS_API_KEY, "regions": "eu", "markets": "h2h,spreads,totals,btts,team_totals,double_chance,draw_no_bet,half_time_full_time,ou_1.5,ou_3.5"}
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.data == "analyze":
+        await query.edit_message_text("Идёт анализ матчей, подождите...")
+        bets = await analyze_matches()
+        text = format_bets(bets)
+        await query.edit_message_text(text)
+    elif query.data == "top_matches":
+        await query.edit_message_text("Функция топ-матчей пока в разработке.")
 
-async def get_xg(team_id, league_id):
-    url = f"https://your-xg-api.com/team/{team_id}/xg?league={league_id}"
-    headers = {"Authorization": f"Bearer {XG_API_KEY}"}
-    async with httpx.AsyncClient() as client:
-        r = await client.get(url, headers=headers)
-        r.raise_for_status()
-        return r.json()["xG"]
-
-def elo_prob(home_elo, away_elo):
-    diff = home_elo - away_elo
-    return 1 / (1 + 10 ** (-diff / 400))
-
-# ---------------- ANALYSIS ----------------
-async def analyze_top_bets():
+# ---------------------- Анализ матчей ----------------------
+async def analyze_matches():
     bets = []
 
+    # Проходим по всем лигам
     for sport, leagues in LEAGUES.items():
         for lname, league_id in leagues:
-            fixtures = await get_fixtures(league_id)
-            odds_list = await get_odds(sport)
+            fixtures = get_fixtures(league_id)  # Реальный API
+            odds_data = get_odds(sport)        # Реальный API
 
             for f in fixtures:
-                home = f["HomeTeam"]
-                away = f["AwayTeam"]
+                home = f["teams"]["home"]
+                away = f["teams"]["away"]
 
-                hxg = await get_xg(home["TeamId"], league_id)
-                axg = await get_xg(away["TeamId"], league_id)
-                elo_home = elo_prob(home["Elo"], away["Elo"])
-
+                hxg = get_xg(home["id"], league_id)
+                axg = get_xg(away["id"], league_id)
                 total_goals = hxg + axg
-                xg_home = hxg / (hxg + axg) if (hxg + axg) > 0 else 0.5
-                model_home = 0.45 * xg_home + 0.35 * elo_home + 0.20 * 0.55
+
+                xg_home = hxg / (hxg + axg) if (hxg+axg) > 0 else 0.5
+                elo_home = elo_prob(home["elo"], away["elo"])
+                model_home = 0.45 * xg_home + 0.35 * elo_home + 0.2 * 0.5
 
                 prob_over25 = min(total_goals / 3.1, 0.78)
                 prob_under25 = 1 - prob_over25
                 prob_btts = min((hxg * axg) / 2.2, 0.75)
 
-                # Проходим по реальным рынкам
-                for market in odds_list:
-                    for bm in market["bookmakers"]:
+                # Проходим по рынкам
+                for g in odds_data:
+                    if home["name"] not in g["home_team"]:
+                        continue
+                    for bm in g["bookmakers"]:
                         for m in bm["markets"]:
                             for o in m["outcomes"]:
                                 implied = 1 / o["price"]
                                 name = o["name"]
 
                                 # 1X2
-                                if m["key"] == "h2h" and name == home["Name"]:
+                                if m["key"] == "h2h" and name == home["name"]:
                                     value = model_home - implied
                                     if value > 0.08:
-                                        bets.append((value, lname, f"{home['Name']} vs {away['Name']}", "П1", o["price"]))
+                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", "П1", o["price"]))
 
-                                # Over / Under
+                                # Totals
                                 if m["key"] == "totals":
                                     if "Over" in name:
                                         value = prob_over25 - implied
                                         if value > 0.08:
-                                            bets.append((value, lname, f"{home['Name']} vs {away['Name']}", name, o["price"]))
+                                            bets.append((value, lname, f"{home['name']} vs {away['name']}", name, o["price"]))
                                     if "Under" in name:
                                         value = prob_under25 - implied
                                         if value > 0.08:
-                                            bets.append((value, lname, f"{home['Name']} vs {away['Name']}", name, o["price"]))
+                                            bets.append((value, lname, f"{home['name']} vs {away['name']}", name, o["price"]))
 
                                 # BTTS
                                 if m["key"] == "btts" and name == "Yes":
                                     value = prob_btts - implied
                                     if value > 0.08:
-                                        bets.append((value, lname, f"{home['Name']} vs {away['Name']}", "BTTS YES", o["price"]))
+                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", "BTTS YES", o["price"]))
+
+                                # Handicap
+                                if m["key"] == "spreads" and name == home["name"]:
+                                    prob = model_home + 0.1
+                                    value = prob - implied
+                                    if value > 0.08:
+                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", f"Фора {o['point']}", o["price"]))
+
+                                if m["key"] == "spreads" and name == away["name"] and o["point"] == 1:
+                                    prob = 1 - model_home + 0.15
+                                    value = prob - implied
+                                    if value > 0.08:
+                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", "Фора +1 (гости)", o["price"]))
+
+                                # Double Chance 1X
+                                if m["key"] == "h2h" and name == home["name"]:
+                                    prob = model_home + 0.25
+                                    value = prob - implied
+                                    if value > 0.08:
+                                        bets.append((value, lname, f"{home['name']} vs {away['name']}", "1X", o["price"]))
 
     bets.sort(reverse=True, key=lambda x: x[0])
     return bets[:12]
 
-# ---------------- BOT HANDLERS ----------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("Топ ставки", callback_data="top_bets")],
-        [InlineKeyboardButton("Помощь", callback_data="help")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text("Привет! Бот запущен и готов к работе.", reply_markup=reply_markup)
+def format_bets(bets):
+    text = "🔥 Рекомендованные ставки:\n\n"
+    for value, league, match, market, odd in bets:
+        text += f"{league}: {match}\n{market} — {odd:.2f} (Value: {value:.2f})\n\n"
+    return text
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data == "top_bets":
-        await query.edit_message_text(text="Идёт анализ матчей, подождите...")
-        bets = await analyze_top_bets()
-        text = "🔥 Топ ставки:\n\n" + "\n".join([f"{l}: {m} — {mk} ({o})" for _, l, m, mk, o in bets])
-        await query.edit_message_text(text=text)
-    elif query.data == "help":
-        await query.edit_message_text(text="Используйте кнопку 'Топ ставки' для получения рекомендаций.")
+# ---------------------- JobQueue ----------------------
+async def notify_top_bets(context: ContextTypes.DEFAULT_TYPE):
+    if TELEGRAM_CHAT_ID:
+        bets = await analyze_matches()
+        text = format_bets(bets)
+        await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=text)
 
-# ---------------- MAIN ----------------
+# ---------------------- Main ----------------------
 def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
 
-    # JobQueue — каждые 10 минут обновление
-    job_queue = app.job_queue
-    job_queue.run_repeating(lambda ctx: asyncio.create_task(analyze_top_bets()), interval=600, first=10)
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_button))
+
+    # JobQueue каждые 10 минут
+    job_queue: JobQueue = app.job_queue
+    job_queue.run_repeating(notify_top_bets, interval=600, first=10)
 
     app.run_polling()
 
