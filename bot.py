@@ -1,61 +1,39 @@
 import os
-import asyncio
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
-    CommandHandler,
     ContextTypes,
+    CommandHandler,
+    JobQueue,
 )
+import asyncio
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # можно не указывать
+# Получаем токен и chat_id из переменных окружения
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")  # id чата, куда отправлять уведомления
 
-# ---------- COMMANDS ----------
-
+# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "🤖 Бот запущен.\n"
-        "Топовые ставки приходят автоматически."
-    )
+    await update.message.reply_text("Привет! Бот запущен и готов к работе.")
 
-# ---------- ANALYTICS ----------
-
-def analyze():
-    # ⚠️ здесь твоя реальная аналитика (xG, Elo, Odds API)
-    return [
-        "⚽ Arsenal vs Brighton\n"
-        "➡️ Over 2.5 @1.92\n"
-        "📈 Value: +11%\n"
-        "🎯 Вероятность: 63%"
-    ]
-
-# ---------- JOB ----------
-
+# Job для отправки уведомлений о топ-ставках
 async def notify_top_bets(context: ContextTypes.DEFAULT_TYPE):
-    bets = analyze()
-    if not bets:
-        return
+    if TELEGRAM_CHAT_ID:
+        await context.bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Топ ставки обновлены!")
 
-    text = "🔥 ТОП СТАВКИ:\n\n" + "\n\n".join(bets)
-
-    if CHAT_ID:
-        await context.bot.send_message(chat_id=CHAT_ID, text=text)
-
-# ---------- MAIN ----------
-
+# Главная функция
 def main():
+    # Создаём приложение
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
+    # Добавляем обработчики команд
     app.add_handler(CommandHandler("start", start))
 
-    # ✅ JobQueue ГАРАНТИРОВАННО есть (из-за [job-queue])
-    app.job_queue.run_repeating(
-        notify_top_bets,
-        interval=900,   # каждые 15 минут
-        first=10
-    )
+    # Получаем JobQueue и добавляем повторяющийся job
+    job_queue: JobQueue = app.job_queue
+    job_queue.run_repeating(notify_top_bets, interval=600, first=10)  # каждые 10 минут
 
-    print("BOT STARTED")
+    # Запускаем бота
     app.run_polling()
 
 if __name__ == "__main__":
