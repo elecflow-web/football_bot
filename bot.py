@@ -1,145 +1,113 @@
 import os
+import logging
 import requests
 import pandas as pd
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
-from datetime import datetime, timedelta
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 
-ODDS_API_KEY = os.getenv("ODDS_API_KEY")
-FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY")
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-STAKES_FILE = "stakes.csv"
+# --- Настройки ---
+ODDS_API_KEY = os.getenv("ODDS_API_KEY", "5f1e3adbb1e334788067c15ccc2e6978")
+FOOTBALL_API_KEY = os.getenv("FOOTBALL_API_KEY", "afd3ed6b02202f71750b0cfcd0cacd5a")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8033902386:AAFILhMFGnFuFU6l6LHWLk5wNxYHCze3Mx8")
+CHAT_ID = os.getenv("YOUR_TELEGRAM_CHAT_ID", "")
 
-if not os.path.exists(STAKES_FILE):
-    pd.DataFrame(columns=["match", "market", "bet", "stake", "odds", "datetime", "status"]).to_csv(STAKES_FILE, index=False, sep=";")
+MAX_BETS = 5
 
-# =======================================
-# Получение матчей и коэффициентов
-# =======================================
-def get_upcoming_matches():
+# --- Логирование ---
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# --- Функции работы с API ---
+def fetch_top_matches():
+    """Возвращает топ матчей с коэффициентами"""
     url = f"https://api.the-odds-api.com/v4/sports/soccer_epl/odds/?apiKey={ODDS_API_KEY}&regions=eu&markets=h2h,spreads,totals"
     try:
-        resp = requests.get(url)
-        if resp.status_code == 200:
-            return resp.json()
-        return []
-    except:
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        logger.error(f"Ошибка при получении данных: {e}")
         return []
 
-# =======================================
-# Анализ матчей, вычисление value
-# =======================================
-def analyze_match(match):
-    best_bets = []
-    match_name = f"{match['home_team']} vs {match['away_team']}"
-    for bookmaker in match['bookmakers']:
-        for market in bookmaker['markets']:
-            for outcome in market['outcomes']:
-                implied_prob = 1 / outcome['price']
-                value = 0.05
-                if implied_prob < (1 - value):
-                    best_bets.append({
-                        "match": match_name,
-                        "market": market['key'],
-                        "bet": outcome['name'],
-                        "odds": outcome['price'],
-                        "value": value
-                    })
-    best_bets = sorted(best_bets, key=lambda x: x['value'], reverse=True)
-    return best_bets[:5]
+def analyze_matches(matches):
+    """Простейший анализ: выбираем топ MAX_BETS по value"""
+    candidates = []
+    for match in matches:
+        try:
+            home_team = match["home_team"]
+            away_team = match["away_team"]
+            commence_time = match["commence_time"]
+            for bookmaker in match.get("bookmakers", []):
+                for market in bookmaker.get("markets", []):
+                    if market["key"] == "h2h":
+                        outcomes = market["outcomes"]
+                        for outcome in outcomes:
+                            value = float(outcome.get("price", 0))
+                            candidates.append({
+                                "match": f"{home_team} vs {away_team}",
+                                "start": commence_time,
+                                "team": outcome["name"],
+                                "odds": value
+                            })
+        except Exception as e:
+            logger.warning(f"Ошибка анализа матча: {e}")
+    df = pd.DataFrame(candidates)
+    if not df.empty:
+        df = df.sort_values("odds", ascending=False).head(MAX_BETS)
+    return df.to_dict("records")
 
-# =======================================
-# Telegram: Главное меню
-# =======================================
+# --- Telegram Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("Топ ставки", callback_data='top')],
-        [InlineKeyboardButton("Мои ставки", callback_data='mybets')]
+        [InlineKeyboardButton("Топ матчей", callback_data="top_matches")],
+        [InlineKeyboardButton("Отслеживать ставки", callback_data="track_bets")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await update.message.reply_text("Привет! Выберите действие:", reply_markup=reply_markup)
 
-# =======================================
-# Кнопки меню и действия
-# =======================================
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
+    
+    if query.data == "top_matches":
+        matches = fetch_top_matches()
+        analyzed = analyze_matches(matches)
+        if analyzed:
+            text = "Топовые ставки:\n\n"
+            for bet in analyzed:
+                text += f"{bet['match']} | Ставка: {bet['team']} | Коэффициент: {bet['odds']}\n"
+        else:
+            text = "Нет доступных ставок."
+        await query.edit_message_text(text)
+    
+    elif query.data == "track_bets":
+        await query.edit_message_text("Здесь будут отслеживаемые ставки. Пока пусто.")
 
-    if data == "top":
-        matches = get_upcoming_matches()
-        if not matches:
-            await query.edit_message_text("Нет доступных матчей.")
-            return
-        message = "Топ ставки:\n"
-        buttons = []
-        for m in matches[:10]:
-            bets = analyze_match(m)
-            for b in bets:
-                message += f"{b['match']} | {b['market']} | {b['bet']} | Коэф: {b['odds']}\n"
-                buttons.append([InlineKeyboardButton(f"Отслеживать {b['bet']}", callback_data=f"track|{b['match']}|{b['market']}|{b['bet']}|{b['odds']}")])
-        buttons.append([InlineKeyboardButton("Назад", callback_data="back")])
-        reply_markup = InlineKeyboardMarkup(buttons)
-        await query.edit_message_text(message, reply_markup=reply_markup)
-
-    elif data.startswith("track|"):
-        _, match_name, market, bet, odds = data.split("|")
-        df = pd.read_csv(STAKES_FILE, sep=";")
-        df = pd.concat([df, pd.DataFrame([{
-            "match": match_name, "market": market, "bet": bet, "stake": 0,
-            "odds": float(odds), "datetime": datetime.now(), "status": "tracking"
-        }])], ignore_index=True)
-        df.to_csv(STAKES_FILE, sep=";", index=False)
-        await query.edit_message_text(f"Ставка {bet} на матч {match_name} теперь отслеживается.")
-
-    elif data == "mybets":
-        df = pd.read_csv(STAKES_FILE, sep=";")
-        if df.empty:
-            await query.edit_message_text("Нет сохраненных ставок.")
-            return
-        message = "Ваши ставки:\n"
-        for _, row in df.iterrows():
-            message += f"{row['match']} | {row['market']} | {row['bet']} | Статус: {row['status']}\n"
-        buttons = [[InlineKeyboardButton("Назад", callback_data="back")]]
-        reply_markup = InlineKeyboardMarkup(buttons)
-        await query.edit_message_text(message, reply_markup=reply_markup)
-
-    elif data == "back":
-        await start(update, context)
-
-# =======================================
-# Авто-обновление топ-ставок
-# =======================================
+# --- Push уведомления по таймеру ---
 async def notify_top_bets(context: ContextTypes.DEFAULT_TYPE):
-    matches = get_upcoming_matches()
-    top_bets = []
-    for m in matches[:10]:
-        top_bets.extend(analyze_match(m))
-    df = pd.read_csv(STAKES_FILE, sep=";")
-    for bet in top_bets:
-        if not ((df['match'] == bet['match']) & (df['market'] == bet['market']) & (df['bet'] == bet['bet'])).any():
-            # Push уведомление
-            chat_id = context.job.data["chat_id"]
-            await context.bot.send_message(chat_id, text=f"Новая топ-ставка:\n{bet['match']} | {bet['market']} | {bet['bet']} | Коэф: {bet['odds']}")
-            # Сохраняем в файл как отслеживаемую
-            df = pd.concat([df, pd.DataFrame([{
-                "match": bet['match'], "market": bet['market'], "bet": bet['bet'],
-                "stake": 0, "odds": bet['odds'], "datetime": datetime.now(), "status": "tracking"
-            }])], ignore_index=True)
-            df.to_csv(STAKES_FILE, sep=";", index=False)
+    matches = fetch_top_matches()
+    analyzed = analyze_matches(matches)
+    if analyzed and CHAT_ID:
+        text = "🔔 Новые топовые ставки:\n\n"
+        for bet in analyzed:
+            text += f"{bet['match']} | Ставка: {bet['team']} | Коэффициент: {bet['odds']}\n"
+        await context.bot.send_message(chat_id=CHAT_ID, text=text)
 
-# =======================================
-# Запуск приложения
-# =======================================
-if __name__ == "__main__":
+# --- Основная функция ---
+def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button))
 
-    # Планировщик авто-уведомлений
-    job_queue: JobQueue = app.job_queue
-    job_queue.run_repeating(notify_top_bets, interval=600, first=10, data={"chat_id": "YOUR_TELEGRAM_CHAT_ID"})
+    # JobQueue для push уведомлений каждые 10 минут
+    if app.job_queue:
+        app.job_queue.run_repeating(notify_top_bets, interval=600, first=10)
 
-    print("Бот запущен...")
     app.run_polling()
+
+if __name__ == "__main__":
+    main()
