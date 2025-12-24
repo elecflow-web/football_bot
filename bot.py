@@ -1,10 +1,6 @@
 import os
 import asyncio
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -12,64 +8,127 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from my_apis import analyze_matches
+from real_apis import (
+    get_fixtures,
+    get_odds,
+    get_xg,
+    elo_prob,
+    LEAGUES,
+)
 
-TOKEN = os.environ.get("TELEGRAM_TOKEN")
+TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-# -----------------------------
-# /start
-# -----------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("📊 Топ ставки сегодня", callback_data="analyze")],
+VALUE_EDGE = 0.01  # ОСЛАБЛЕННЫЙ VALUE (как ты просил)
+TOP_LIMIT = 5
+
+
+# ===================== CORE ANALYTICS =====================
+
+def analyze_all_matches():
+    results = []
+
+    for league in LEAGUES:
+        fixtures = get_fixtures(league)
+
+        for match in fixtures:
+            odds = get_odds(match["id"])
+            if not odds:
+                continue
+
+            xg_home, xg_away = get_xg(match["home"], match["away"])
+            prob_home = elo_prob(match["home"], match["away"])
+
+            for market in odds:
+                bookmaker_prob = 1 / market["odd"]
+                model_prob = prob_home if market["side"] == "home" else (1 - prob_home)
+
+                edge = model_prob - bookmaker_prob
+
+                results.append({
+                    "league": league,
+                    "match": f'{match["home"]} vs {match["away"]}',
+                    "market": market["name"],
+                    "odd": market["odd"],
+                    "prob": model_prob,
+                    "edge": edge,
+                })
+
+    return results
+
+
+def select_bets():
+    all_bets = analyze_all_matches()
+
+    # 1️⃣ VALUE (ослабленный)
+    value_bets = [
+        b for b in all_bets
+        if b["edge"] >= VALUE_EDGE and b["odd"] >= 1.6
     ]
-    await update.message.reply_text(
-        "Привет! Я анализирую матчи по коэффициентам и value.\n"
-        "Нажми кнопку ниже 👇",
-        reply_markup=InlineKeyboardMarkup(keyboard),
+
+    value_bets.sort(key=lambda x: x["edge"], reverse=True)
+
+    if value_bets:
+        return value_bets[:TOP_LIMIT], "value"
+
+    # 2️⃣ FALLBACK — лучшие из доступных
+    fallback = sorted(
+        all_bets,
+        key=lambda x: (x["edge"], x["odd"]),
+        reverse=True
     )
 
-# -----------------------------
-# Callback handler
-# -----------------------------
-async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    return fallback[:TOP_LIMIT], "fallback"
+
+
+# ===================== TELEGRAM =====================
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🔥 Топ ставки сегодня", callback_data="top")]
+    ]
+    await update.message.reply_text(
+        "Выберите действие:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+
+
+async def top_bets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    if query.data == "analyze":
-        await query.edit_message_text("⏳ Идёт анализ матчей, подождите...")
+    await query.edit_message_text("📊 Анализирую матчи, подождите...")
 
-        # ⚠️ КЛЮЧЕВОЙ МОМЕНТ — чтобы НЕ ВИСЛО
-        loop = asyncio.get_running_loop()
-        bets = await loop.run_in_executor(None, analyze_matches)
+    bets, mode = select_bets()
 
-        if not bets:
-            await query.edit_message_text("❌ Подходящих value-ставок не найдено.")
-            return
+    if not bets:
+        await query.edit_message_text("❌ Сегодня рынок пуст.")
+        return
 
-        text = "🔥 *ТОП VALUE-СТАВКИ*\n\n"
-        for i, (value, league, match, market, odds) in enumerate(bets, 1):
-            text += (
-                f"{i}. *{match}*\n"
-                f"Лига: {league}\n"
-                f"Рынок: {market}\n"
-                f"Коэфф: {odds}\n"
-                f"Value: {value:.2f}\n\n"
-            )
+    text = "🔥 **ТОП СТАВКИ СЕГОДНЯ**\n\n"
+    if mode == "fallback":
+        text += "_Value не найден — показаны лучшие доступные_\n\n"
 
-        await query.edit_message_text(text, parse_mode="Markdown")
+    for b in bets:
+        text += (
+            f"🏟 {b['match']}\n"
+            f"📌 {b['market']}\n"
+            f"🎯 Кэф: {b['odd']}\n"
+            f"📈 Edge: {b['edge']:.3f}\n\n"
+        )
 
-# -----------------------------
-# MAIN
-# -----------------------------
+    await query.edit_message_text(text, parse_mode="Markdown")
+
+
+# ===================== BOOT =====================
+
 def main():
     app = ApplicationBuilder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(callbacks))
+    app.add_handler(CallbackQueryHandler(top_bets, pattern="top"))
 
-    print("BOT STARTED")
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
