@@ -1,7 +1,9 @@
-python-telegram-bot[job-queue]==20.3
+python-telegram-bot==20.3
 pandas
-numpy
 requests
-httpx==0.24.1
+httpx~=0.24.0
+numpy
+
+
 
 
