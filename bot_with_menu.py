@@ -10,6 +10,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.request import HTTPXRequest
 
 from deep_analysis_v2 import find_value_bets
 from logger import log_bet
@@ -229,12 +230,22 @@ def main():
     try:
         logger.info("🚀 ЗАПУСК BETTING БОТА...")
 
-        app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+        # Создаём custom Request с увеличенным таймаутом
+        request = HTTPXRequest(
+            connect_timeout=30.0,
+            read_timeout=30.0,
+            write_timeout=30.0,
+            pool_timeout=30.0,
+        )
+
+        # Создаём приложение с кастомным Request
+        app = ApplicationBuilder().token(TELEGRAM_TOKEN).request(request).build()
 
         app.add_handler(CommandHandler("start", start))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
         logger.info("✅ Бот готов к работе!")
+        logger.info("⏰ Таймауты установлены: 30 сек")
         app.run_polling(allowed_updates=Update.ALL_TYPES)
 
     except Exception as e:
